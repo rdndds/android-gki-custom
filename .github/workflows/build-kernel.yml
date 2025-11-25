@@ -1,0 +1,343 @@
+name: Android12-5.10-Custom
+
+permissions:
+  contents: write  # diperlukan untuk membuat & mengubah release
+
+on:
+  workflow_dispatch:
+    inputs:
+      os_patch_level:
+        required: false
+        type: string
+        description: >
+          Patch level of common kernel manifest,
+          for example: 2024-11
+      os_version:
+        required: true
+        type: string
+        default: 12.0.0
+        description: >
+          OS Version of boot image
+          for example: 12.0.0
+      custom:
+        required: true
+        type: boolean
+        default: true
+        description: >
+          Enable LXC, Docker features (apply custom patches/configs)
+      kernelsu:
+        required: true
+        type: boolean
+        default: true
+        description: >
+          Build KernelSU variant and create release
+      kernelsu_branch:
+        required: false
+        type: string
+        default: dev
+        description: >
+          Branch or version of KernelSU to use,
+          for example: stable, dev, v1.0.3
+      kernelsu_next:
+        required: true
+        type: boolean
+        default: true
+        description: >
+          Build KernelSU-Next variant and create release
+      kernelsu_next_branch:
+        required: false
+        type: string
+        default: dev
+        description: >
+          Branch or version of KernelSU-Next to use,
+          for example: stable, dev, v1.0.3
+
+jobs:
+  KernelSU:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.kernelsu == 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Install Dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/*
+          sudo apt update -qq
+          sudo apt install -qq wget
+          curl -o repo https://storage.googleapis.com/git-repo-downloads/repo
+          chmod a+x repo
+          sudo mv repo /usr/local/bin/
+
+      - name: Sync the kernel source code
+        run: |
+          mkdir android-kernel && cd android-kernel
+          repo init --depth 1 \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b common-android12-5.10${{ github.event.inputs.os_patch_level && '-' || '' }}${{ github.event.inputs.os_patch_level || '' }}
+          repo sync -c -j"$(nproc --all)" --no-clone-bundle --optimized-fetch
+
+      - name: Apply patches and configuration files
+        if: ${{ github.event.inputs.custom == 'true' }}
+        run: |
+          mkdir -p ./android-kernel/common/arch/arm64/configs/
+          cp ./config/gki_defconfig-android12-5.10 ./android-kernel/common/arch/arm64/configs/gki_defconfig
+          cd android-kernel/common
+          git apply "$GITHUB_WORKSPACE"/patches/android12-5.10/*.patch
+
+      - name: Use KernelSU
+        run: |
+          cd android-kernel/common
+          if [[ "${{ github.event.inputs.kernelsu_branch }}" == "stable" ]]; then
+            echo "Using KernelSU stable branch."
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          elif [[ "${{ github.event.inputs.kernelsu_branch }}" == "dev" ]]; then
+            echo "Using KernelSU dev branch."
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+          else
+            echo "Using KernelSU specific branch: ${{ github.event.inputs.kernelsu_branch }}"
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s ${{ github.event.inputs.kernelsu_branch || 'main' }}
+          fi
+
+      - name: Commit changes (if any)
+        if: ${{ github.event.inputs.custom == 'true' || github.event.inputs.kernelsu == 'true' }}
+        run: |
+          git config --global user.email "cloudorzi@gmail.com"
+          git config --global user.name "1orz"
+          cd android-kernel/common
+          git add .
+          # Hindari error jika tidak ada perubahan
+          if ! git diff --cached --quiet; then
+            git commit -m "Custom Kernel (KernelSU)"
+          else
+            echo "No changes to commit."
+          fi
+          git status
+
+      - name: Build Kernel
+        run: |
+          cd android-kernel
+          BUILD_CONFIG=common/build.config.gki.aarch64 build/config.sh savedefconfig
+          LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh -j"$(nproc)"
+
+      - name: Build boot.img
+        env:
+          OS_PATCH_LEVEL: ${{ github.event.inputs.os_patch_level }}
+          OS_VERSION: ${{ github.event.inputs.os_version }}
+        run: |
+          cd android-kernel/tools/mkbootimg
+          wget -q https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-2024-11_r4.zip -O gki-boot.zip
+          unzip -q gki-boot.zip
+          PATCH_LEVEL="${OS_PATCH_LEVEL:-2024-11}"
+          ./unpack_bootimg.py --boot_img boot*.img
+          ./mkbootimg.py \
+            --header_version 4 \
+            --os_version "${OS_VERSION:-12.0.0}" \
+            --os_patch_level "${PATCH_LEVEL}" \
+            --kernel "$GITHUB_WORKSPACE/android-kernel/out/android12-5.10/dist/Image" \
+            --ramdisk out/ramdisk \
+            --output boot.img
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          cp android-kernel/out/android12-5.10/dist/Image artifacts/
+          cp android-kernel/tools/mkbootimg/boot.img artifacts/
+
+      - name: Set release metadata
+        id: vars
+        env:
+          OS_PATCH_LEVEL: ${{ github.event.inputs.os_patch_level }}
+        run: |
+          # Patch level default untuk metadata release jika kosong
+          PATCH_LEVEL="${OS_PATCH_LEVEL:-2024-11}"
+          if [ -n "$OS_PATCH_LEVEL" ]; then
+            TAG_SUFFIX="-$OS_PATCH_LEVEL"
+          else
+            TAG_SUFFIX=""
+          fi
+
+          TAG_NAME="android12-5.10${TAG_SUFFIX}-kernelsu"
+          RELEASE_NAME="KernelSU Android12-5.10${TAG_SUFFIX}"
+
+          echo "patch_level=$PATCH_LEVEL" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.vars.outputs.tag_name }}
+          release_name: ${{ steps.vars.outputs.release_name }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Image to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./artifacts/Image
+          asset_name: Image-${{ steps.vars.outputs.tag_name }}
+          asset_content_type: application/octet-stream
+
+      - name: Upload boot.img to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./artifacts/boot.img
+          asset_name: boot-${{ steps.vars.outputs.tag_name }}.img
+          asset_content_type: application/octet-stream
+
+  KernelSU-Next:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.kernelsu_next == 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Install Dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/*
+          sudo apt update -qq
+          sudo apt install -qq wget
+          curl -o repo https://storage.googleapis.com/git-repo-downloads/repo
+          chmod a+x repo
+          sudo mv repo /usr/local/bin/
+
+      - name: Sync the kernel source code
+        run: |
+          mkdir android-kernel && cd android-kernel
+          repo init --depth 1 \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b common-android12-5.10${{ github.event.inputs.os_patch_level && '-' || '' }}${{ github.event.inputs.os_patch_level || '' }}
+          repo sync -c -j"$(nproc --all)" --no-clone-bundle --optimized-fetch
+
+      - name: Apply patches and configuration files
+        if: ${{ github.event.inputs.custom == 'true' }}
+        run: |
+          mkdir -p ./android-kernel/common/arch/arm64/configs/
+          cp ./config/gki_defconfig-android12-5.10 ./android-kernel/common/arch/arm64/configs/gki_defconfig
+          cd android-kernel/common
+          git apply "$GITHUB_WORKSPACE"/patches/android12-5.10/*.patch
+
+      - name: Use KernelSU Next
+        run: |
+          cd android-kernel/common
+          if [[ "${{ github.event.inputs.kernelsu_next_branch }}" == "stable" ]]; then
+            echo "Using KernelSU-Next stable branch."
+            curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -
+          elif [[ "${{ github.event.inputs.kernelsu_next_branch }}" == "dev" ]]; then
+            echo "Using KernelSU-Next dev branch."
+            curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          else
+            echo "Using KernelSU-Next specific branch: ${{ github.event.inputs.kernelsu_next_branch }}"
+            curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s ${{ github.event.inputs.kernelsu_next_branch || 'next' }}
+          fi
+
+      - name: Commit changes (if any)
+        if: ${{ github.event.inputs.custom == 'true' || github.event.inputs.kernelsu_next == 'true' }}
+        run: |
+          git config --global user.email "cloudorzi@gmail.com"
+          git config --global user.name "1orz"
+          cd android-kernel/common
+          git add .
+          # Hindari error jika tidak ada perubahan
+          if ! git diff --cached --quiet; then
+            git commit -m "Custom Kernel (KernelSU-Next)"
+          else
+            echo "No changes to commit."
+          fi
+          git status
+
+      - name: Build Kernel
+        run: |
+          cd android-kernel
+          BUILD_CONFIG=common/build.config.gki.aarch64 build/config.sh savedefconfig
+          LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh -j"$(nproc)"
+
+      - name: Build boot.img
+        env:
+          OS_PATCH_LEVEL: ${{ github.event.inputs.os_patch_level }}
+          OS_VERSION: ${{ github.event.inputs.os_version }}
+        run: |
+          cd android-kernel/tools/mkbootimg
+          wget -q https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-2024-11_r6.zip -O gki-boot.zip
+          unzip -q gki-boot.zip
+          PATCH_LEVEL="${OS_PATCH_LEVEL:-2024-11}"
+          ./unpack_bootimg.py --boot_img boot*.img
+          ./mkbootimg.py \
+            --header_version 4 \
+            --os_version "${OS_VERSION:-12.0.0}" \
+            --os_patch_level "${PATCH_LEVEL}" \
+            --kernel "$GITHUB_WORKSPACE/android-kernel/out/android12-5.10/dist/Image" \
+            --ramdisk out/ramdisk \
+            --output boot.img
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          cp android-kernel/out/android12-5.10/dist/Image artifacts/
+          cp android-kernel/tools/mkbootimg/boot.img artifacts/
+
+      - name: Set release metadata
+        id: vars
+        env:
+          OS_PATCH_LEVEL: ${{ github.event.inputs.os_patch_level }}
+        run: |
+          PATCH_LEVEL="${OS_PATCH_LEVEL:-2024-11}"
+          if [ -n "$OS_PATCH_LEVEL" ]; then
+            TAG_SUFFIX="-$OS_PATCH_LEVEL"
+          else
+            TAG_SUFFIX=""
+          fi
+
+          TAG_NAME="android12-5.10${TAG_SUFFIX}-kernelsu-next"
+          RELEASE_NAME="KernelSU-Next Android12-5.10${TAG_SUFFIX}"
+
+          echo "patch_level=$PATCH_LEVEL" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.vars.outputs.tag_name }}
+          release_name: ${{ steps.vars.outputs.release_name }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Image to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./artifacts/Image
+          asset_name: Image-${{ steps.vars.outputs.tag_name }}
+          asset_content_type: application/octet-stream
+
+      - name: Upload boot.img to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./artifacts/boot.img
+          asset_name: boot-${{ steps.vars.outputs.tag_name }}.img
+          asset_content_type: application/octet-stream
